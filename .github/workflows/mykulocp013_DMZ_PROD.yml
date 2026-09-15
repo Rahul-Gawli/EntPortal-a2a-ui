@@ -1,0 +1,231 @@
+name: mykulocp013_PROD_PROD2
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select environment (prod-dmz, prod2-dmz)"
+        required: true
+        default: "prod-dmz"
+        type: choice
+        options:
+          - prod-dmz
+          - prod2-dmz
+
+run-name: Deploy ${{ github.event.inputs.environment }} from ${{ github.ref_name }}
+
+env:
+  NODE_VERSION: 22.12.0
+  SERVICE_NAME: "a2a-ui"
+  IMAGE_TAG: ${{ github.ref_name }}-${{ github.run_number }}
+
+  HTTP_PROXY: http://b2b-http.dhl.com:8080
+  HTTPS_PROXY: http://b2b-http.dhl.com:8080
+  NO_PROXY: "localhost,127.0.0.1,.dhl.com"
+
+  # Environment specific variables
+  ARTIFACTORY_URL_DEV: enterpriseportal-docker-dev-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_DEV: enterpriseportal-docker-dev
+
+  ARTIFACTORY_URL_UAT: enterpriseportal-docker-dev-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_UAT: enterpriseportal-docker-uat
+
+  ARTIFACTORY_URL_PROD: enterpriseportal-docker-release-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_PROD: enterpriseportal-docker-prod
+
+  ARTIFACTORY_URL_DMZ-PROD2: enterpriseportal-docker-release-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_DMZ-PROD2: enterpriseportal-docker-dmz-prod2
+  
+  ARTIFACTORY_URL_DMZ-UAT: enterpriseportal-docker-dev-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_DMZ-UAT: enterpriseportal-docker-dmz-uat
+
+  ARTIFACTORY_URL_DMZ-PROD: enterpriseportal-docker-release-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_DMZ-PROD: enterpriseportal-docker-dmz-prod
+
+  ARTIFACTORY_URL_DR-PROD: enterpriseportal-docker-release-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_DR-PROD: enterpriseportal-docker-dev
+
+  ARTIFACTORY_URL_dr-dmz-prod: enterpriseportal-docker-release-local.artifactory.dhl.com
+  ARTIFACTORY_REPO_dr-dmz-prod: enterpriseportal-docker-prod
+  
+  # OpenShift URLs
+  OCP_SERVER_URL_DEV: https://api.mykulocp013.dhl.com:6443
+  OCP_SERVER_URL_PROD: https://api.mykulocp013.dhl.com:6443
+
+jobs:
+  build:
+    runs-on: arc-large
+    env:
+      ENV: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Copy package.json and dist to temp dir
+        run: |
+          mkdir -p /home/runner/work/tmp-github
+          cp package.json /home/runner/work/tmp-github
+          cp -r dist /home/runner/work/tmp-github
+          
+      - name: Configure NPM and Build Angular
+        run: |
+          npm config set strict-ssl false
+          npm cache clean --force
+          npm ci --legacy-peer-deps
+          npm install ./dist/bd-common-lib --legacy-peer-deps
+          npm install moment ngx-pagination ngx-toastr crypto-ts --legacy-peer-deps
+          npm install -g @angular/cli@19
+          ng build --configuration=${{ env.ENV }} --base-href=/a2a/ --aot
+          ls -l dist
+          
+      - name: Upload Built dist as Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: dist
+          path: ./dist/bd-a2a
+          
+  docker:
+    needs: build
+    runs-on: arc-large-container
+    env:
+      ENV: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Dist File
+        uses: actions/download-artifact@v3
+        with:
+          name: dist
+          path: ./dist/bd-a2a
+
+          
+      - name: Set Env Variables per Environment
+        id: set-vars
+        run: |
+          if [ "${ENV}" == "development" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DEV }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DEV }}" >> $GITHUB_ENV
+          elif [ "${ENV}" == "uat" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DEV }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_UAT }}" >> $GITHUB_ENV
+          elif [ "${ENV}" == "prod" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_PROD }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_PROD }}" >> $GITHUB_ENV  
+          elif [ "${ENV}" == "prod2" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_PROD2 }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_PROD2 }}" >> $GITHUB_ENV             
+          elif [ "${ENV}" == "prod2-dmz" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DMZ-prod2 }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DMZ-prod2 }}" >> $GITHUB_ENV
+          elif [ "${ENV}" == "prod-dmz" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DMZ-PROD }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DMZ-PROD }}" >> $GITHUB_ENV            
+          elif [ "${ENV}" == "dr-prod" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DR-PROD }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DR-PROD }}" >> $GITHUB_ENV
+          elif [ "${ENV}" == "dr-dmz-prod" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_dr-dmz-prod }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_dr-dmz-prod}}" >> $GITHUB_ENV            
+          else
+            echo "Invalid ENV: ${ENV}"
+            exit 1
+          fi
+      - name: Docker Login
+        run: |
+          echo -n "2302131626@Bdel" | docker login ${{ env.ART_URL }} -u "ragohil" --password-stdin
+      - name: Build and Push Docker Image
+        run: |
+          docker build \
+          --build-arg HTTP_PROXY=$HTTP_PROXY \
+          --build-arg HTTPS_PROXY=$HTTPS_PROXY \
+          --build-arg NO_PROXY=$NO_PROXY \
+          -t ${{ env.ART_URL }}/${{ env.ART_REPO }}/entportal-${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }} -f Dockerfile-dmz .
+          docker push ${{ env.ART_URL }}/${{ env.ART_REPO }}/entportal-${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
+  deploy:
+    needs: docker
+    runs-on: arc-large
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download OpenShift CLI
+        run: |
+          curl -u "ragohil:2302131626@Bdel" \
+          -O "https://artifactory.dhl.com/artifactory/enterpriseportal-docker-release/origin-cli/oc.tar.gz"
+          tar -xvzf oc.tar.gz
+          chmod +x oc
+          mkdir -p $HOME/.local/bin
+          mv oc $HOME/.local/bin/
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Authenticate and set context
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ env.OCP_SERVER_URL_PROD }}
+          openshift_username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          openshift_password: ${{ secrets.ARTIFACTORY_PASSWORD }}      
+
+      - name: Set Env Variables per Environment
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "development" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DEV }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DEV }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-dev
+          elif [ "${{ github.event.inputs.environment }}" == "uat" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DEV }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_UAT }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-uat
+          elif [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_PROD }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_PROD }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-prod
+          elif [ "${{ github.event.inputs.environment }}" == "prod2-dmz" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DMZ-PROD2 }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DMZ-PROD2 }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-dmz-prod2              
+          elif [ "${{ github.event.inputs.environment }}" == "uat-dmz" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DMZ-UAT }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DMZ-UAT }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-dmz-uat
+          elif [ "${{ github.event.inputs.environment }}" == "prod-dmz" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DMZ-PROD }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DMZ-PROD }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-dmz-prod            
+          elif [ "${{ github.event.inputs.environment }}" == "dr-prod" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_DR-PROD }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_DR-PROD }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-dr-prod
+          elif [ "${{ github.event.inputs.environment }}" == "dr-dmz-prod" ]; then
+            echo "ART_URL=${{ env.ARTIFACTORY_URL_dr-dmz-prod }}" >> $GITHUB_ENV
+            echo "ART_REPO=${{ env.ARTIFACTORY_REPO_dr-dmz-prod }}" >> $GITHUB_ENV
+            oc project ecs-enterprise-portal-dr-dmz-prod            
+          else
+            echo "Invalid ENV: ${{ github.event.inputs.environment }}"
+            exit 1
+          fi
+      - name: Generate Final Deployment YAML
+        run: |
+          # if ! command -v envsubst &> /dev/null; then
+          #   sudo apt-get update && sudo apt-get install -y gettext-base
+          # fi
+          source $GITHUB_ENV
+          export SERVICE_NAME=${{ env.SERVICE_NAME }}
+          export IMAGE_TAG=${{ env.IMAGE_TAG }}
+          export ART_URL=${ART_URL}
+          export ART_REPO=${ART_REPO}
+          echo "Using image: ${ART_URL}/${ART_REPO}/entportal-${SERVICE_NAME}:${IMAGE_TAG}"
+          perl -pe 's/\$\{?(\w+)\}?/$ENV{$1}/g' deployment.yml > final-deployment.yml
+          # envsubst < deployment.yml > final-deployment.yml
+          echo "Generated final-deployment.yml:"
+          cat final-deployment.yml
+      - name: Apply Deployment to OpenShift
+        run: |
+          oc apply -f final-deployment.yml
+          oc rollout status deployment/entportal-${{ env.SERVICE_NAME }}
+          echo "Deployment Successful in ${{ github.event.inputs.environment }}"
